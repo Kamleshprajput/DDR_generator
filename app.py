@@ -86,7 +86,7 @@ def get_severity_class(level: str) -> str:
     return ''
 
 
-def create_pdf_report(report: DDRReport, thermal_images: list) -> bytes:
+def create_pdf_report(report: DDRReport, thermal_images: list, inspection_images: list = None) -> bytes:
     """Create a PDF report using ReportLab."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
@@ -151,6 +151,24 @@ def create_pdf_report(report: DDRReport, thermal_images: list) -> bytes:
         <b>Thermal Data:</b> {obs.get('thermal_data', 'Not Available')}<br/>
         """
         story.append(Paragraph(obs_text, styles['Normal']))
+        
+        # Add thermal image if available
+        page_num = obs.get('thermal_image_page')
+        if page_num:
+            matching_image = next(
+                (img for img in thermal_images if img.page_num == page_num),
+                None
+            )
+            if matching_image:
+                try:
+                    img_data = base64.b64decode(matching_image.base64_data)
+                    img_buffer = io.BytesIO(img_data)
+                    img = RLImage(img_buffer, width=5*inch, height=3.75*inch)  # Maintain aspect ratio
+                    story.append(img)
+                    story.append(Paragraph(f"<i>Thermal Image - Page {page_num}</i>", styles['Normal']))
+                except Exception as e:
+                    story.append(Paragraph(f"<i>Image from page {page_num} could not be included</i>", styles['Normal']))
+        
         story.append(Spacer(1, 0.1*inch))
     story.append(Spacer(1, 0.2*inch))
     
@@ -191,10 +209,18 @@ def create_pdf_report(report: DDRReport, thermal_images: list) -> bytes:
     return buffer.getvalue()
 
 
-def display_report(report: DDRReport, thermal_images: list):
+def display_report(report: DDRReport, thermal_images: list, inspection_images: list = None):
     """Display the DDR report in Streamlit."""
     st.markdown("## Detailed Diagnostic Report (DDR)")
     st.markdown(f"*Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}*")
+    
+    # Show summary of extracted images
+    if thermal_images or inspection_images:
+        with st.expander("📸 Extracted Images Summary", expanded=False):
+            if thermal_images:
+                st.write(f"**Thermal Images:** {len(thermal_images)} image(s) extracted from thermal report")
+            if inspection_images:
+                st.write(f"**Inspection Images:** {len(inspection_images)} image(s) extracted from inspection report")
     
     # Property Summary
     st.markdown("### Property Summary")
@@ -247,8 +273,27 @@ def display_report(report: DDRReport, thermal_images: list):
                 )
                 if matching_image:
                     st.write(f"**Thermal Image (Page {page_num}):**")
-                    img_data = base64.b64decode(matching_image.base64_data)
-                    st.image(img_data, use_container_width=True)
+                    try:
+                        img_data = base64.b64decode(matching_image.base64_data)
+                        st.image(img_data, use_container_width=True, caption=f"Thermal image from page {page_num}")
+                    except Exception as e:
+                        st.warning(f"Could not display image: {e}")
+            
+            # Display inspection images if available (show all images from the PDF)
+            if inspection_images:
+                # Display all images from inspection report that are in the file
+                displayed_count = 0
+                for img in inspection_images:
+                    try:
+                        img_data = base64.b64decode(img.base64_data)
+                        st.write(f"**Inspection Image (Page {img.page_num}):**")
+                        st.image(img_data, use_container_width=True, caption=f"Inspection image from page {img.page_num}")
+                        displayed_count += 1
+                        # Limit to prevent too many images (max 5 per area)
+                        if displayed_count >= 5:
+                            break
+                    except Exception as e:
+                        continue
     st.divider()
     
     # Root Causes
@@ -286,7 +331,7 @@ def display_report(report: DDRReport, thermal_images: list):
     col1, col2 = st.columns(2)
     with col1:
         # PDF Export
-        pdf_bytes = create_pdf_report(report, thermal_images)
+        pdf_bytes = create_pdf_report(report, thermal_images, inspection_images if inspection_images else [])
         st.download_button(
             label="📥 Export as PDF",
             data=pdf_bytes,
@@ -316,6 +361,8 @@ def main():
         st.session_state.report = None
     if 'thermal_images' not in st.session_state:
         st.session_state.thermal_images = []
+    if 'inspection_images' not in st.session_state:
+        st.session_state.inspection_images = []
     
     # File upload section
     if st.session_state.report is None:
@@ -368,6 +415,7 @@ def main():
                 
                 # Store images for later use
                 st.session_state.thermal_images = thermal_images
+                st.session_state.inspection_images = inspection_images
                 
                 # Step 2: Send to Gemini
                 status_text.text("🤖 Analyzing documents with Gemini AI...")
@@ -418,12 +466,17 @@ def main():
     
     else:
         # Display report
-        display_report(st.session_state.report, st.session_state.thermal_images)
+        display_report(
+            st.session_state.report, 
+            st.session_state.thermal_images,
+            st.session_state.inspection_images
+        )
         
         # Reset button
         if st.button("🔄 Upload New Reports", use_container_width=True):
             st.session_state.report = None
             st.session_state.thermal_images = []
+            st.session_state.inspection_images = []
             st.rerun()
 
 
