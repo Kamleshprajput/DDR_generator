@@ -156,14 +156,22 @@ def create_pdf_report(report: DDRReport, thermal_images: list) -> bytes:
     
     # Root Causes
     story.append(Paragraph("Root Causes", heading_style))
-    for cause in report.root_causes:
-        story.append(Paragraph(f"• {cause}", styles['Normal']))
+    if isinstance(report.root_causes, list) and len(report.root_causes) > 0:
+        for cause in report.root_causes:
+            story.append(Paragraph(f"• {cause}", styles['Normal']))
+    else:
+        root_causes_text = report.root_causes if isinstance(report.root_causes, str) else "Not Available"
+        story.append(Paragraph(root_causes_text, styles['Normal']))
     story.append(Spacer(1, 0.2*inch))
     
     # Recommended Actions
     story.append(Paragraph("Recommended Actions", heading_style))
-    for action in report.recommended_actions:
-        story.append(Paragraph(f"• {action}", styles['Normal']))
+    if isinstance(report.recommended_actions, list) and len(report.recommended_actions) > 0:
+        for action in report.recommended_actions:
+            story.append(Paragraph(f"• {action}", styles['Normal']))
+    else:
+        recommended_text = report.recommended_actions if isinstance(report.recommended_actions, str) else "Not Available"
+        story.append(Paragraph(recommended_text, styles['Normal']))
     story.append(Spacer(1, 0.2*inch))
     
     # Additional Notes
@@ -173,7 +181,7 @@ def create_pdf_report(report: DDRReport, thermal_images: list) -> bytes:
         story.append(Spacer(1, 0.2*inch))
     
     # Missing Information
-    if report.missing_information:
+    if report.missing_information and isinstance(report.missing_information, list) and len(report.missing_information) > 0:
         story.append(Paragraph("Missing Information", heading_style))
         for item in report.missing_information:
             story.append(Paragraph(f"• {item}", styles['Normal']))
@@ -245,14 +253,20 @@ def display_report(report: DDRReport, thermal_images: list):
     
     # Root Causes
     st.markdown("### Root Causes")
-    for cause in report.root_causes:
-        st.write(f"• {cause}")
+    if isinstance(report.root_causes, list) and len(report.root_causes) > 0:
+        for cause in report.root_causes:
+            st.write(f"• {cause}")
+    else:
+        st.write(report.root_causes if isinstance(report.root_causes, str) else "Not Available")
     st.divider()
     
     # Recommended Actions
     st.markdown("### Recommended Actions")
-    for action in report.recommended_actions:
-        st.write(f"• {action}")
+    if isinstance(report.recommended_actions, list) and len(report.recommended_actions) > 0:
+        for action in report.recommended_actions:
+            st.write(f"• {action}")
+    else:
+        st.write(report.recommended_actions if isinstance(report.recommended_actions, str) else "Not Available")
     st.divider()
     
     # Additional Notes
@@ -262,7 +276,7 @@ def display_report(report: DDRReport, thermal_images: list):
         st.divider()
     
     # Missing Information
-    if report.missing_information:
+    if report.missing_information and isinstance(report.missing_information, list) and len(report.missing_information) > 0:
         st.markdown("### Missing Information")
         for item in report.missing_information:
             st.write(f"• {item}")
