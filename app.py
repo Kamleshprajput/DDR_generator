@@ -97,8 +97,76 @@ def priority_badge(priority: str) -> str:
     return ""
 
 
+def extract_page(pdf_bytes: bytes, page_num: int, dpi: int = 150) -> Image.Image | None:
+    """
+    Extract a single page from a PDF and return a cropped PIL Image.
+    Automatically crops out whitespace-heavy borders and text-only regions
+    so only the actual photo/thermal content is returned.
+    Page numbers are 1-indexed.
+    """
+    try:
+        pages = convert_from_bytes(
+            pdf_bytes, dpi=dpi,
+            first_page=page_num, last_page=page_num,
+            fmt="jpeg",
+        )
+        if not pages:
+            return None
+        img = pages[0]
+        return _smart_crop(img)
+    except Exception as e:
+        err = str(e)
+        if "poppler" in err.lower() or "Unable to get page count" in err:
+            st.error(
+                "poppler is not installed or not in PATH.\n\n"
+                "**Streamlit Cloud:** make sure your repo has a `packages.txt` "
+                "file containing `poppler-utils`.\n\n"
+                "**Local (Mac):** `brew install poppler`\n"
+                "**Local (Ubuntu/Debian):** `sudo apt-get install poppler-utils`"
+            )
+        return None
+
+
+def _smart_crop(img: Image.Image) -> Image.Image:
+    """
+    Crop a PDF page image to the most visually interesting region.
+    Strategy:
+      - Convert to grayscale
+      - Find rows/cols that are NOT near-white (i.e. contain actual content)
+      - Expand bounding box by a small margin and return that crop
+    Falls back to the full image if nothing useful is found.
+    """
+    import numpy as np
+    gray = img.convert("L")
+    arr  = np.array(gray)
+
+    # Pixels darker than 240 are considered "content" (not blank white)
+    content_mask = arr < 240
+
+    rows_with_content = content_mask.any(axis=1)
+    cols_with_content = content_mask.any(axis=0)
+
+    row_indices = np.where(rows_with_content)[0]
+    col_indices = np.where(cols_with_content)[0]
+
+    if len(row_indices) == 0 or len(col_indices) == 0:
+        return img  # nothing to crop, return as-is
+
+    top    = max(0, int(row_indices[0])  - 10)
+    bottom = min(img.height, int(row_indices[-1]) + 10)
+    left   = max(0, int(col_indices[0]) - 10)
+    right  = min(img.width,  int(col_indices[-1]) + 10)
+
+    # Only crop if it removes at least 5% of the page — avoids micro-crops
+    h_reduction = (img.height - (bottom - top))  / img.height
+    w_reduction = (img.width  - (right  - left))  / img.width
+    if h_reduction > 0.05 or w_reduction > 0.05:
+        return img.crop((left, top, right, bottom))
+    return img
+
+
 def extract_images_from_pdf(pdf_bytes: bytes, max_pages: int = 40, dpi: int = 100) -> list:
-    """Convert PDF pages to PIL Images using poppler via pdf2image."""
+    """Extract all pages as PIL Images (used for page-count discovery only)."""
     try:
         images = convert_from_bytes(
             pdf_bytes, dpi=dpi,
@@ -174,7 +242,7 @@ def _card(inner_rows, col_w, bg=None):
     return t
 
 
-def generate_pdf(data: dict, insp_imgs: list, therm_imgs: list, had_thermal: bool) -> bytes:
+def generate_pdf(data: dict, area_images: dict, had_thermal: bool) -> bytes:
     buf = io.BytesIO()
     W_PAGE, H_PAGE = A4
     LM = RM = 20 * mm
@@ -340,11 +408,8 @@ def generate_pdf(data: dict, insp_imgs: list, therm_imgs: list, had_thermal: boo
     # ── Section 2 — Area-wise with images ─────────────────────────────
     sec("Area-wise findings", "Visual Observation & Thermal Readings")
 
-    n_areas       = max(len(areas), 1)
-    ipp           = max(1, len(insp_imgs) // n_areas)     # inspection pages per area
-    tpp           = max(1, len(therm_imgs) // n_areas) if had_thermal else 0
-
-    for idx, area in enumerate(areas):
+    for area in areas:
+        aname = area.get("name", "Area")
         neg   = area.get("negativeFindings", "")
         pos   = area.get("positiveFindings", "")
         therm = area.get("thermalData", "")
@@ -353,7 +418,7 @@ def generate_pdf(data: dict, insp_imgs: list, therm_imgs: list, had_thermal: boo
 
         sev_pill = pill(sev or "N/A", sbg, sfg, 22*mm)
         hdr = Table(
-            [[Paragraph(area.get("name","Area"), S["bold"]), sev_pill]],
+            [[Paragraph(aname, S["bold"]), sev_pill]],
             colWidths=[W - 34*mm, 32*mm],
         )
         hdr.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),
@@ -380,10 +445,9 @@ def generate_pdf(data: dict, insp_imgs: list, therm_imgs: list, had_thermal: boo
                                      ("RIGHTPADDING",(0,0),(-1,-1),8)]))
             card_items += [Spacer(1,2*mm), tb]
 
-        # Images for this area
-        i_slice = insp_imgs[idx*ipp : idx*ipp + ipp]
-        t_slice = therm_imgs[idx*tpp : idx*tpp + tpp] if had_thermal and tpp else []
-        all_area_imgs = i_slice + t_slice
+        # Only Gemini-assigned images for this area (max 4)
+        assigned     = area_images.get(aname, {})
+        all_area_imgs = (assigned.get("insp", []) + assigned.get("therm", []))[:4]
 
         if all_area_imgs:
             card_items.append(Spacer(1, 3*mm))
@@ -529,18 +593,21 @@ def generate_pdf(data: dict, insp_imgs: list, therm_imgs: list, had_thermal: boo
     story.append(Spacer(1, 8*mm))
 
     # ── Image Appendix ─────────────────────────────────────────────────
-    gallery = (
-        [("Inspection", i, im) for i, im in enumerate(insp_imgs, 1)] +
-        ([("Thermal", i, im) for i, im in enumerate(therm_imgs, 1)] if had_thermal else [])
-    )
+    # Collect all assigned images across all areas for the appendix
+    gallery = []
+    for aname, imgs_dict in area_images.items():
+        for img in imgs_dict.get("insp", []):
+            gallery.append((f"Inspection – {aname}", img))
+        for img in imgs_dict.get("therm", []):
+            gallery.append((f"Thermal – {aname}", img))
     if gallery:
         story.append(PageBreak())
         sec("Appendix", "Image References")
         COLS = 2
         cw = (W - (COLS-1)*4*mm) / COLS
         row_buf = []
-        for source, i, im in gallery:
-            cap = Paragraph(f"{source} — Page {i}", S["caption"])
+        for source, im in gallery:
+            cap = Paragraph(source, S["caption"])
             cell = Table([[rl_img(im, cw)], [cap]], colWidths=[cw])
             cell.setStyle(TableStyle([
                 ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),3),
@@ -657,14 +724,17 @@ if st.button("🔍 Generate Detailed Diagnosis Report", disabled=not ready):
     thermal_bytes    = thermal_file.read() if thermal_file else None
     has_thermal      = thermal_bytes is not None
 
-    # Step 1 — extract images
-    with st.spinner("📄 Extracting images from PDFs…"):
-        insp_imgs  = extract_images_from_pdf(inspection_bytes, max_pages=40, dpi=100)
-        therm_imgs = extract_images_from_pdf(thermal_bytes,    max_pages=40, dpi=100) if has_thermal else []
+    # Step 1 — get page counts (low DPI just to count pages quickly)
+    with st.spinner("📄 Reading PDF page counts…"):
+        insp_pages_all  = extract_images_from_pdf(inspection_bytes, max_pages=60, dpi=40)
+        therm_pages_all = extract_images_from_pdf(thermal_bytes,    max_pages=60, dpi=40) if has_thermal else []
+        n_insp  = len(insp_pages_all)
+        n_therm = len(therm_pages_all)
+        del insp_pages_all, therm_pages_all  # free memory — we'll re-extract only needed pages later
 
     st.info(
-        f"Extracted {len(insp_imgs)} page(s) from inspection"
-        + (f" and {len(therm_imgs)} from thermal." if has_thermal else ".")
+        f"Found {n_insp} page(s) in inspection PDF"
+        + (f" and {n_therm} in thermal PDF." if has_thermal else ".")
     )
 
     # Step 2 — Gemini analysis
@@ -720,8 +790,23 @@ Respond with ONLY valid JSON, no markdown fences, no preamble:
     }
   ],
   "additionalNotes": "Conflicts or unusual findings — or Not Available",
-  "missingInfo": ["each absent or unclear item"]
-}"""
+  "missingInfo": ["each absent or unclear item"],
+  "imageAssignments": [
+    {
+      "areaName": "Exact area name matching one of the areas above",
+      "inspectionPages": [<list of 1-indexed page numbers from DOCUMENT 1 that show this area>],
+      "thermalPages": [<list of 1-indexed page numbers from DOCUMENT 2 that show this area — empty list [] if no thermal doc>]
+    }
+  ]
+}
+
+IMPORTANT for imageAssignments:
+- Look at the actual content of each page — photos of tile gaps, dampness, cracks, thermal readings etc.
+- Only assign pages that genuinely show the named area — do NOT assign every page.
+- Pages showing checklists, text-only content, cover pages, or table of contents should NOT be assigned to any area.
+- A page may be assigned to at most ONE area (the most relevant one).
+- If no relevant page exists for an area, use empty lists.
+- Thermal document pages typically show a thermal camera image (coloured heat map) paired with a regular photo — assign these to the area they depict."""
 
     USER = (
         "Analyze the uploaded PDF(s) and return a complete DDR JSON.\n\n"
@@ -735,7 +820,7 @@ Respond with ONLY valid JSON, no markdown fences, no preamble:
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(
-                model_name="gemini-2.5-flash",
+                model_name="gemini-1.5-pro",
                 generation_config=genai.GenerationConfig(
                     temperature=0.1,
                     response_mime_type="application/json",
@@ -769,9 +854,42 @@ Respond with ONLY valid JSON, no markdown fences, no preamble:
                 st.stop()
 
             data = json.loads(m.group())
+
+            # Extract only the pages Gemini assigned — smart crop each one
+            assignments = data.get("imageAssignments", [])
+            area_images = {}   # areaName -> {"insp": [PIL], "therm": [PIL]}
+
+            if assignments:
+                with st.spinner("🖼️ Extracting relevant images from PDFs…"):
+                    for assign in assignments:
+                        name   = assign.get("areaName", "")
+                        i_pgs  = assign.get("inspectionPages", [])
+                        t_pgs  = assign.get("thermalPages", [])
+
+                        insp_extracted  = []
+                        therm_extracted = []
+
+                        for pg in i_pgs:
+                            if isinstance(pg, int) and 1 <= pg <= n_insp:
+                                img = extract_page(inspection_bytes, pg, dpi=150)
+                                if img:
+                                    insp_extracted.append(img)
+
+                        for pg in t_pgs:
+                            if has_thermal and isinstance(pg, int) and 1 <= pg <= n_therm:
+                                img = extract_page(thermal_bytes, pg, dpi=150)
+                                if img:
+                                    therm_extracted.append(img)
+
+                        if name:
+                            area_images[name] = {
+                                "insp": insp_extracted,
+                                "therm": therm_extracted,
+                            }
+
             st.session_state.update({
                 "ddr_data": data, "had_thermal": has_thermal,
-                "insp_imgs": insp_imgs, "therm_imgs": therm_imgs,
+                "area_images": area_images,
             })
 
         except json.JSONDecodeError as e:
@@ -797,8 +915,7 @@ Respond with ONLY valid JSON, no markdown fences, no preamble:
 if "ddr_data" in st.session_state:
     data        = st.session_state["ddr_data"]
     had_thermal = st.session_state.get("had_thermal", False)
-    insp_imgs   = st.session_state.get("insp_imgs", [])
-    therm_imgs  = st.session_state.get("therm_imgs", [])
+    area_images = st.session_state.get("area_images", {})
 
     prop    = data.get("property", {})
     summ    = data.get("summary", {})
@@ -852,11 +969,8 @@ if "ddr_data" in st.session_state:
     # S2 — Areas with inline images
     st.markdown("""<div class="section-wrap"><div class="section-tag"><span class="section-tag-dot"></span>Area-wise findings</div><p class="section-title">Visual Observation &amp; Thermal Readings</p>""", unsafe_allow_html=True)
 
-    n_areas = max(len(areas), 1)
-    ipp     = max(1, len(insp_imgs) // n_areas)
-    tpp     = max(1, len(therm_imgs) // n_areas) if had_thermal else 0
-
-    for idx, area in enumerate(areas):
+    for area in areas:
+        aname = area.get("name", "Area")
         neg   = area.get("negativeFindings","")
         pos   = area.get("positiveFindings","")
         therm = area.get("thermalData","")
@@ -864,7 +978,7 @@ if "ddr_data" in st.session_state:
 
         st.markdown(f"""
         <div class="area-card">
-            <div class="area-header"><span class="area-name">{area.get('name','Area')}</span>{severity_badge(area.get('severity',''))}</div>
+            <div class="area-header"><span class="area-name">{aname}</span>{severity_badge(area.get('severity',''))}</div>
             <div style="font-size:13px;line-height:1.65;color:#555;">
                 {"<p><strong style='color:#1a1a1a;'>Damage observed (negative side):</strong><br>"+neg+"</p>" if neg else ""}
                 {"<p style='margin-top:6px;'><strong style='color:#1a1a1a;'>Root cause area (positive side):</strong><br>"+pos+"</p>" if pos else ""}
@@ -872,10 +986,12 @@ if "ddr_data" in st.session_state:
             </div>
         </div>""", unsafe_allow_html=True)
 
-        i_slice = insp_imgs [idx*ipp : idx*ipp + ipp]
-        t_slice = therm_imgs[idx*tpp : idx*tpp + tpp] if had_thermal and tpp else []
-        imgs    = i_slice + t_slice
+        # Show only Gemini-assigned images for this area
+        assigned = area_images.get(aname, {})
+        imgs     = assigned.get("insp", []) + assigned.get("therm", [])
         if imgs:
+            # Max 4 images per area in a row to keep sizes reasonable
+            imgs = imgs[:4]
             cols = st.columns(len(imgs))
             for col, img in zip(cols, imgs):
                 col.image(img, use_container_width=True)
@@ -936,7 +1052,7 @@ if "ddr_data" in st.session_state:
     # Download buttons
     st.markdown("<br>", unsafe_allow_html=True)
     with st.spinner("📄 Building PDF…"):
-        pdf_bytes = generate_pdf(data, insp_imgs, therm_imgs, had_thermal)
+        pdf_bytes = generate_pdf(data, area_images, had_thermal)
 
     dl1, dl2, dl3 = st.columns(3)
     with dl1:
@@ -953,6 +1069,6 @@ if "ddr_data" in st.session_state:
         )
     with dl3:
         if st.button("🔄 Generate New Report"):
-            for k in ["ddr_data","had_thermal","insp_imgs","therm_imgs"]:
+            for k in ["ddr_data","had_thermal","area_images"]:
                 st.session_state.pop(k, None)
             st.rerun()
