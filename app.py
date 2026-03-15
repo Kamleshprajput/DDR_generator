@@ -391,7 +391,7 @@ Return ONLY the JSON — no other text."""
             # Configure Gemini
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(
-                model_name="gemini-1.5-pro",
+                model_name="gemini-2.5-flash",
                 generation_config=genai.GenerationConfig(
                     temperature=0.1,       # Low temp = consistent, factual output
                     response_mime_type="application/json",  # Force JSON output
