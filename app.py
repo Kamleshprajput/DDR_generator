@@ -820,7 +820,7 @@ IMPORTANT for imageAssignments:
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(
-                model_name="gemini-1.5-pro",
+                model_name="gemini-2.5-flash",
                 generation_config=genai.GenerationConfig(
                     temperature=0.1,
                     response_mime_type="application/json",
