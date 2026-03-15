@@ -282,15 +282,16 @@ def generate_pdf(data: dict, area_images: dict, had_thermal: bool) -> bytes:
         "ok":          _ps("ok", fontSize=10, textColor=GRN_FG),
     }
 
-    prop    = data.get("property", {})
-    summ    = data.get("summary", {})
-    areas   = data.get("areas", [])
-    causes  = data.get("rootCauses", [])
-    sev_rsn = data.get("severityReasoning", "")
-    actions = data.get("actions", [])
-    notes   = data.get("additionalNotes", "")
-    missing = data.get("missingInfo", [])
-    gen_on  = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    prop          = data.get("property", {})
+    summ          = data.get("summary", {})
+    areas         = data.get("areas", [])
+    causes        = data.get("rootCauses", [])
+    sev_rsn       = data.get("severityReasoning", "")
+    actions       = data.get("actions", [])
+    notes         = data.get("additionalNotes", "")
+    missing       = data.get("missingInfo", [])
+    therm_summary = data.get("thermalSummary", "")
+    gen_on        = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     story = []
 
@@ -436,8 +437,14 @@ def generate_pdf(data: dict, area_images: dict, had_thermal: bool) -> bytes:
                            Paragraph("Root cause area (positive side):", S["bold"]),
                            Paragraph(pos, S["body"])]
         if therm and therm.strip().lower() not in ("not available","n/a",""):
-            tb = Table([[Paragraph(f"Thermal: {therm}", S["thermal"])]],
-                       colWidths=[W - 28*mm])
+            therm_sb = area.get("thermalSeverityBasis","")
+            therm_content = [Paragraph(f"Thermal reading: {therm}", S["thermal"])]
+            if therm_sb and therm_sb.strip().lower() not in ("not available","n/a",""):
+                therm_content.append(
+                    Paragraph(therm_sb, _ps("tsb", fontSize=8, textColor=BLUE_FG,
+                                            leading=11, leftIndent=6))
+                )
+            tb = Table([[item] for item in therm_content], colWidths=[W - 28*mm])
             tb.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),BLUE_BG),
                                      ("TOPPADDING",(0,0),(-1,-1),5),
                                      ("BOTTOMPADDING",(0,0),(-1,-1),5),
@@ -445,16 +452,34 @@ def generate_pdf(data: dict, area_images: dict, had_thermal: bool) -> bytes:
                                      ("RIGHTPADDING",(0,0),(-1,-1),8)]))
             card_items += [Spacer(1,2*mm), tb]
 
-        # Only Gemini-assigned images for this area (max 4)
-        assigned     = area_images.get(aname, {})
-        all_area_imgs = (assigned.get("insp", []) + assigned.get("therm", []))[:4]
+        # Gemini-assigned images — inspection and thermal shown in labelled pairs
+        assigned   = area_images.get(aname, {})
+        insp_set   = assigned.get("insp",  [])[:3]
+        therm_set  = assigned.get("therm", [])[:2]
+        all_imgs   = insp_set + therm_set
 
-        if all_area_imgs:
+        if all_imgs:
             card_items.append(Spacer(1, 3*mm))
-            n_img = len(all_area_imgs)
-            img_w = (W - 28*mm - (n_img - 1)*3*mm) / n_img
-            img_cells = [rl_img(im, img_w) for im in all_area_imgs]
-            img_tbl = Table([img_cells], colWidths=[img_w]*n_img)
+            labels   = (["Inspection"] * len(insp_set)) + (["Thermal"] * len(therm_set))
+            n_img    = len(all_imgs)
+            img_w    = (W - 28*mm - (n_img - 1)*3*mm) / n_img
+
+            # Caption row
+            cap_cells = [
+                Paragraph(lbl, _ps(f"ic{k}", fontSize=7, textColor=MGRAY,
+                                    leading=9, alignment=TA_CENTER))
+                for k, lbl in enumerate(labels)
+            ]
+            cap_tbl = Table([cap_cells], colWidths=[img_w]*n_img)
+            cap_tbl.setStyle(TableStyle([
+                ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),2),
+                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),2),
+            ]))
+            card_items.append(cap_tbl)
+
+            # Image row
+            img_cells = [rl_img(im, img_w) for im in all_imgs]
+            img_tbl   = Table([img_cells], colWidths=[img_w]*n_img)
             img_tbl.setStyle(TableStyle([
                 ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
                 ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),2),
@@ -475,6 +500,12 @@ def generate_pdf(data: dict, area_images: dict, had_thermal: bool) -> bytes:
     else:
         story.append(Paragraph("Not Available", S["body"]))
     story.append(Spacer(1, 8*mm))
+
+    # ── Section 3b — Thermal Summary ──────────────────────────────────
+    if had_thermal and therm_summary and therm_summary.strip().lower() not in ("not available","n/a","none",""):
+        sec("Thermal scan summary", "What the Thermal Scan Revealed")
+        story.append(Paragraph(therm_summary, S["body"]))
+        story.append(Spacer(1, 8*mm))
 
     # ── Section 4 — Severity ───────────────────────────────────────────
     sec("Severity assessment", "Issue Severity Overview")
@@ -550,8 +581,15 @@ def generate_pdf(data: dict, area_images: dict, had_thermal: bool) -> bytes:
             else:
                 title_tbl = title_row_items[0]
 
+            targets = action.get("targetAreas", [])
+            target_text = "Applies to: " + ", ".join(targets) if targets else ""
             right_col = [title_tbl,
                          Paragraph(action.get("description",""), S["act_desc"])]
+            if target_text:
+                right_col.append(
+                    Paragraph(target_text, _ps("ta", fontSize=8, textColor=MGRAY,
+                                               leading=11, leftIndent=6))
+                )
             arow = Table([[num_t, right_col]], colWidths=[10*mm, W - 10*mm])
             arow.setStyle(TableStyle([
                 ("VALIGN",(0,0),(-1,-1),"TOP"),
@@ -738,21 +776,69 @@ if st.button("🔍 Generate Detailed Diagnosis Report", disabled=not ready):
     )
 
     # Step 2 — Gemini analysis
-    SYSTEM = """You are UrbanRoof's expert building diagnostics AI. Analyze inspection forms
-and thermal imaging reports to generate professional Detailed Diagnosis Reports (DDR).
+    SYSTEM = """You are UrbanRoof's expert building diagnostics AI. Your job is to read an
+inspection report and optional thermal imaging report, cross-reference them deeply,
+and produce a structured Detailed Diagnosis Report (DDR) as JSON.
 
-DYNAMIC DOCUMENT RULES:
-- Every document may differ: property type, floors, number of areas, checklist format, thermal format.
-- Do NOT assume fixed area names or fixed layouts — read whatever is in the document.
-- Extract ALL impacted areas found in the inspection report.
-- Correlate thermal readings to visual observations when thermal doc is provided.
-- If thermal doc is absent, set thermalData to "Not Available" for all areas.
-- Write "Not Available" for any field genuinely missing — never invent data.
-- Note conflicts between documents in additionalNotes.
-- Use plain, client-friendly language.
+═══════════════════════════════════════════════════
+STEP A — READ & INDEX EVERY PAGE BEFORE WRITING JSON
+═══════════════════════════════════════════════════
+Before producing any output, mentally build an index:
 
-Respond with ONLY valid JSON, no markdown fences, no preamble:
+For DOCUMENT 1 (Inspection Report):
+  For each page, note:
+  - Is it a cover/TOC/disclaimer/text-only page? → skip for images
+  - Is it a photo page? → note the EXACT location label visible in the caption or
+    surrounding text (e.g. "Hall Skirting", "Master Bedroom 1st Floor",
+    "Common Bathroom Ground Floor"). Be as specific as the document is.
+  - Is it a checklist/form page? → extract observations but do NOT assign as image
 
+For DOCUMENT 2 (Thermal Report):
+  Each page typically has:
+  - A thermal camera image (false-colour heat map showing hotspot/coldspot temps)
+  - A paired visible-light photo of the same location
+  - A data panel showing: Hotspot °C, Coldspot °C, Emissivity, Date/Time
+  For each thermal page, note:
+  - The exact location visible in the visible-light photo
+  - The hotspot and coldspot temperatures
+  - The timestamp (helps sequence observations)
+
+═══════════════════════════════════════════════════
+STEP B — CROSS-REFERENCE THERMAL ↔ INSPECTION
+═══════════════════════════════════════════════════
+Match each thermal page to its corresponding inspection observation using:
+1. LOCATION MATCH — the physical location visible in the photo must match
+   the area name exactly, not just the flat number.
+   BAD: "this thermal page is from Flat 103 so assign to all Flat 103 areas"
+   GOOD: "this thermal page shows skirting-level dampness at a wall corner →
+          matches the area named Bedroom Skirting Level Dampness"
+
+2. TEMPERATURE INTERPRETATION — use the hotspot/coldspot delta to assess severity:
+   - Coldspot 3°C+ below ambient (23°C) = active moisture/wet surface → High severity
+   - Coldspot 1–3°C below ambient = residual dampness → Moderate severity
+   - Coldspot < 1°C below ambient = dry or minor surface variation → Low severity
+   - Ambient reference: 23°C (emissivity 0.94 in all thermal images)
+
+3. VISUAL CONFIRMATION — only link a thermal page to an inspection area if
+   the visible-light photo in the thermal page shows the SAME physical damage
+   (same wall, same corner, same type of defect) as described in the inspection.
+
+═══════════════════════════════════════════════════
+STEP C — IMAGE ASSIGNMENT RULES (strict)
+═══════════════════════════════════════════════════
+When assigning pages to areas:
+- Assign a page only if its caption/label/photo content explicitly shows that
+  SPECIFIC room/location — not just the same flat.
+- A page showing "Hall ceiling dampness" → assign ONLY to the Hall area.
+- A page showing "Master Bedroom skirting" → assign ONLY to Master Bedroom area.
+- Text-only pages, cover pages, TOC, disclaimers, checklist forms → assign to NO area.
+- Each page may appear in at most ONE area assignment.
+- Max 3 inspection pages and 2 thermal pages per area.
+- If no photo exists for an area, use empty lists — never assign a wrong page.
+
+═══════════════════════════════════════════════════
+OUTPUT — valid JSON only, no markdown, no preamble
+═══════════════════════════════════════════════════
 {
   "property": {
     "address": "full address or Not Available",
@@ -766,53 +852,66 @@ Respond with ONLY valid JSON, no markdown fences, no preamble:
     "previousRepairs": "Yes / No / Not Available"
   },
   "summary": {
-    "totalIssues": <integer>,
-    "criticalAreas": <integer>,
+    "totalIssues": <integer — number of distinct impacted areas>,
+    "criticalAreas": <integer — count of High severity areas>,
     "areasInspected": <integer>,
     "overallCondition": "Good / Moderate / Poor"
   },
   "areas": [
     {
-      "name": "Exact area name from document",
-      "severity": "High / Moderate / Low",
-      "negativeFindings": "Damage/dampness/leakage on impacted side",
-      "positiveFindings": "Root-cause issue on source side",
-      "thermalData": "Hotspot °C, Coldspot °C + interpretation — or Not Available"
+      "name": "Specific area name — include room + location e.g. Master Bedroom Skirting Level",
+      "severity": "High / Moderate / Low — informed by thermal coldspot delta if available",
+      "negativeFindings": "What damage is visible on the impacted side — be specific about location within room",
+      "positiveFindings": "What root-cause defect is visible on the source side",
+      "thermalData": "Hotspot X°C, Coldspot Y°C, delta Z°C below ambient — interpretation e.g. active moisture or Not Available",
+      "thermalSeverityBasis": "One sentence explaining how the thermal reading informed the severity rating — or Not Available"
     }
   ],
-  "rootCauses": ["cause 1", "cause 2"],
-  "severityReasoning": "Short paragraph explaining severity assessment",
+  "rootCauses": [
+    "Each distinct root cause — specific, not generic (e.g. gaps in tile grout joints allowing capillary moisture rise through RCC slab)"
+  ],
+  "severityReasoning": "Paragraph explaining overall severity — reference specific thermal readings where available",
   "actions": [
     {
       "title": "Short action name",
       "priority": "Immediate / Short-term / Long-term",
-      "description": "Step-by-step repair in plain language"
+      "description": "Step-by-step repair in plain language",
+      "targetAreas": ["area name 1", "area name 2"]
     }
   ],
-  "additionalNotes": "Conflicts or unusual findings — or Not Available",
+  "thermalSummary": "Overall summary of what the thermal scan revealed — temperature ranges found, number of active moisture zones, how findings compare to visual inspection",
+  "additionalNotes": "Document conflicts, unusual findings, or Not Available",
   "missingInfo": ["each absent or unclear item"],
   "imageAssignments": [
     {
-      "areaName": "Exact area name matching one of the areas above",
-      "inspectionPages": [<list of 1-indexed page numbers from DOCUMENT 1 that show this area>],
-      "thermalPages": [<list of 1-indexed page numbers from DOCUMENT 2 that show this area — empty list [] if no thermal doc>]
+      "areaName": "Must exactly match one of the area names above",
+      "inspectionPages": [<1-indexed page numbers — only pages whose photo caption/content explicitly names this specific room/location>],
+      "thermalPages": [<1-indexed page numbers from thermal doc whose visible-light photo shows this exact location>]
     }
   ]
-}
+}"""
 
-IMPORTANT for imageAssignments:
-- Look at the actual content of each page — photos of tile gaps, dampness, cracks, thermal readings etc.
-- Only assign pages that genuinely show the named area — do NOT assign every page.
-- Pages showing checklists, text-only content, cover pages, or table of contents should NOT be assigned to any area.
-- A page may be assigned to at most ONE area (the most relevant one).
-- If no relevant page exists for an area, use empty lists.
-- Thermal document pages typically show a thermal camera image (coloured heat map) paired with a regular photo — assign these to the area they depict."""
+    # Build a page manifest to give Gemini a concrete reference frame
+    page_manifest = f"DOCUMENT 1 (Inspection Report): {n_insp} pages total\n"
+    if has_thermal:
+        page_manifest += (
+            f"DOCUMENT 2 (Thermal Images Report): {n_therm} pages total\n"
+            f"Note: Each page of Document 2 contains one thermal camera image "
+            f"(false-colour heat map) paired with a visible-light photo of the same location, "
+            f"plus a data panel showing Hotspot/Coldspot temperatures.\n"
+        )
 
     USER = (
-        "Analyze the uploaded PDF(s) and return a complete DDR JSON.\n\n"
-        "Documents:\n- DOCUMENT 1: Inspection Report\n"
-        + ("- DOCUMENT 2: Thermal Images Report\n" if has_thermal
-           else "- No thermal doc. Set thermalData to 'Not Available'.\n")
+        "Follow Steps A, B, C from your instructions and produce the DDR JSON.\n\n"
+        + page_manifest
+        + "\nKey reminder for imageAssignments:\n"
+        + "- Do NOT assign pages based on flat number alone.\n"
+        + "- Only assign a page if its visible photo content shows that specific room/location.\n"
+        + "- Text pages, checklists, cover pages = no image assignment.\n"
+        + ("- For each thermal page, the visible-light photo tells you the exact location — "
+           "use that to match to the inspection area, not the flat number.\n"
+           if has_thermal else
+           "- No thermal document provided. Set thermalData to Not Available for all areas.\n")
         + "\nReturn ONLY the JSON."
     )
 
@@ -917,15 +1016,16 @@ if "ddr_data" in st.session_state:
     had_thermal = st.session_state.get("had_thermal", False)
     area_images = st.session_state.get("area_images", {})
 
-    prop    = data.get("property", {})
-    summ    = data.get("summary", {})
-    areas   = data.get("areas", [])
-    causes  = data.get("rootCauses", [])
-    sev_rsn = data.get("severityReasoning", "")
-    actions = data.get("actions", [])
-    notes   = data.get("additionalNotes", "")
-    missing = data.get("missingInfo", [])
-    gen_on  = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    prop          = data.get("property", {})
+    summ          = data.get("summary", {})
+    areas         = data.get("areas", [])
+    causes        = data.get("rootCauses", [])
+    sev_rsn       = data.get("severityReasoning", "")
+    actions       = data.get("actions", [])
+    notes         = data.get("additionalNotes", "")
+    missing       = data.get("missingInfo", [])
+    therm_summary = data.get("thermalSummary", "")
+    gen_on        = datetime.now().strftime("%d %b %Y, %I:%M %p")
 
     # Header
     st.markdown(f"""
@@ -970,11 +1070,21 @@ if "ddr_data" in st.session_state:
     st.markdown("""<div class="section-wrap"><div class="section-tag"><span class="section-tag-dot"></span>Area-wise findings</div><p class="section-title">Visual Observation &amp; Thermal Readings</p>""", unsafe_allow_html=True)
 
     for area in areas:
-        aname = area.get("name", "Area")
-        neg   = area.get("negativeFindings","")
-        pos   = area.get("positiveFindings","")
-        therm = area.get("thermalData","")
-        tnote = f'<div class="thermal-note">🌡️ Thermal: {therm}</div>' if therm and therm.strip().lower() not in ("not available","n/a","") else ""
+        aname    = area.get("name", "Area")
+        neg      = area.get("negativeFindings","")
+        pos      = area.get("positiveFindings","")
+        therm    = area.get("thermalData","")
+        therm_sb = area.get("thermalSeverityBasis","")
+
+        has_therm = therm and therm.strip().lower() not in ("not available","n/a","")
+        has_sb    = therm_sb and therm_sb.strip().lower() not in ("not available","n/a","")
+
+        tnote = ""
+        if has_therm:
+            tnote = f'''<div class="thermal-note">
+                <strong>🌡️ Thermal reading:</strong> {therm}
+                {f'<br><span style="font-size:11px;opacity:0.85;">{therm_sb}</span>' if has_sb else ""}
+            </div>'''
 
         st.markdown(f"""
         <div class="area-card">
@@ -986,14 +1096,20 @@ if "ddr_data" in st.session_state:
             </div>
         </div>""", unsafe_allow_html=True)
 
-        # Show only Gemini-assigned images for this area
-        assigned = area_images.get(aname, {})
-        imgs     = assigned.get("insp", []) + assigned.get("therm", [])
-        if imgs:
-            # Max 4 images per area in a row to keep sizes reasonable
-            imgs = imgs[:4]
-            cols = st.columns(len(imgs))
-            for col, img in zip(cols, imgs):
+        # Inspection images (left) and thermal images (right) — side by side per pair
+        assigned   = area_images.get(aname, {})
+        insp_imgs  = assigned.get("insp",  [])[:3]
+        therm_imgs = assigned.get("therm", [])[:2]
+
+        if insp_imgs or therm_imgs:
+            # Show inspection and thermal images in labelled columns
+            all_pairs = (
+                [("📷 Inspection", img) for img in insp_imgs] +
+                [("🌡️ Thermal",    img) for img in therm_imgs]
+            )
+            cols = st.columns(len(all_pairs))
+            for col, (label, img) in zip(cols, all_pairs):
+                col.caption(label)
                 col.image(img, use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1003,6 +1119,14 @@ if "ddr_data" in st.session_state:
     for c in (causes or ["Not Available"]):
         st.markdown(f'<div class="cause-row"><div class="cause-icon">!</div><div class="cause-text">{c}</div></div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # S3b — Thermal Summary (only if thermal doc was provided)
+    if had_thermal and therm_summary and therm_summary.strip().lower() not in ("not available","n/a","none",""):
+        st.markdown(f"""<div class="section-wrap">
+            <div class="section-tag"><span class="section-tag-dot"></span>Thermal scan summary</div>
+            <p class="section-title">What the Thermal Scan Revealed</p>
+            <p style="font-size:13px;line-height:1.75;color:#555;">{therm_summary}</p>
+        </div>""", unsafe_allow_html=True)
 
     # S4 — Severity
     high_c = sum(1 for a in areas if "high"     in a.get("severity","").lower() or "critical" in a.get("severity","").lower())
@@ -1023,12 +1147,21 @@ if "ddr_data" in st.session_state:
         st.markdown('<p style="color:#999;font-size:13px;">Not Available</p>', unsafe_allow_html=True)
     else:
         for i, action in enumerate(actions, 1):
+            targets     = action.get("targetAreas", [])
+            targets_html = ""
+            if targets:
+                pills = "".join(
+                    f'<span style="font-size:10px;background:#f0f0f0;color:#555;padding:2px 7px;border-radius:10px;margin-right:4px;">{t}</span>'
+                    for t in targets
+                )
+                targets_html = f'<div style="margin-top:4px;">{pills}</div>'
             st.markdown(f"""
             <div class="action-item">
                 <div class="action-num">{i}</div>
                 <div>
                     <div class="action-title">{action.get('title','Action')} &nbsp;{priority_badge(action.get('priority',''))}</div>
                     <div class="action-desc">{action.get('description','')}</div>
+                    {targets_html}
                 </div>
             </div>""", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
