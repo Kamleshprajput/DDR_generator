@@ -67,14 +67,12 @@ div[data-testid="stFileUploader"] { border:none !important; }
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_api_key() -> str:
-    """Read from st.secrets first; fall back to manual sidebar input."""
+    """Read Gemini API key from st.secrets only."""
     try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-    return st.session_state.get("manual_api_key", "")
+        return st.secrets["GEMINI_API_KEY"]
+    except KeyError:
+        st.error("GEMINI_API_KEY not found in Streamlit secrets.")
+        st.stop()
 
 
 def severity_badge(sev: str) -> str:
@@ -595,36 +593,19 @@ st.markdown("""
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
-
-    key_in_secrets = False
-    try:
-        key_in_secrets = bool(st.secrets.get("GEMINI_API_KEY", ""))
-    except Exception:
-        pass
-
-    if key_in_secrets:
-        st.success("✅ API key loaded from secrets")
-    else:
-        manual_key = st.text_input(
-            "Google Gemini API Key", type="password",
-            placeholder="AIza...",
-            help="Get key at aistudio.google.com/app/apikey",
-        )
-        st.session_state["manual_api_key"] = manual_key
-        if manual_key:
-            st.success("✅ Key entered")
-        else:
-            st.info("Enter key or add GEMINI_API_KEY to Streamlit secrets")
-
-    st.markdown("---")
-    st.markdown("**To use secrets (Streamlit Cloud):**")
-    st.code("GEMINI_API_KEY = 'AIza...'", language="toml")
-    st.markdown("---")
+    st.markdown("### ℹ️ About")
     st.markdown("**Works with any:**")
     st.markdown("- Flat / row house / bungalow / CHS")
     st.markdown("- Any number of impacted areas")
     st.markdown("- With or without thermal PDF")
+    st.markdown("---")
+    st.markdown("**Report includes:**")
+    st.markdown("- Property summary")
+    st.markdown("- Area-wise observations + images")
+    st.markdown("- Root cause analysis")
+    st.markdown("- Severity assessment")
+    st.markdown("- Recommended actions")
+    st.markdown("- Downloadable PDF")
 
 # ── Upload ────────────────────────────────────────────────────────────────────
 st.markdown("### 📂 Upload Documents")
@@ -654,11 +635,9 @@ with c2:
 st.markdown("<br>", unsafe_allow_html=True)
 
 api_key = get_api_key()
-ready   = bool(inspection_file and api_key)
+ready   = bool(inspection_file)
 
-if not api_key:
-    st.info("👈 Enter your Gemini API key in the sidebar.")
-elif not inspection_file:
+if not inspection_file:
     st.info("Upload the Inspection Report PDF above.")
 
 # ── Generate ──────────────────────────────────────────────────────────────────
@@ -746,7 +725,7 @@ Respond with ONLY valid JSON, no markdown fences, no preamble:
         try:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(
-                model_name="gemini-1.5-pro",
+                model_name="gemini-2.5-flash",
                 generation_config=genai.GenerationConfig(
                     temperature=0.1,
                     response_mime_type="application/json",
