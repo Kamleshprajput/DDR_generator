@@ -98,7 +98,7 @@ def priority_badge(priority: str) -> str:
 
 
 def extract_images_from_pdf(pdf_bytes: bytes, max_pages: int = 40, dpi: int = 100) -> list:
-    """Convert PDF pages to PIL Images. Returns [] on failure."""
+    """Convert PDF pages to PIL Images using poppler via pdf2image."""
     try:
         images = convert_from_bytes(
             pdf_bytes, dpi=dpi,
@@ -107,7 +107,17 @@ def extract_images_from_pdf(pdf_bytes: bytes, max_pages: int = 40, dpi: int = 10
         )
         return images
     except Exception as e:
-        st.warning(f"Image extraction warning: {e}")
+        err = str(e)
+        if "poppler" in err.lower() or "Unable to get page count" in err:
+            st.error(
+                "poppler is not installed or not in PATH.\n\n"
+                "**Streamlit Cloud:** make sure your repo has a `packages.txt` "
+                "file containing `poppler-utils`.\n\n"
+                "**Local (Mac):** `brew install poppler`\n"
+                "**Local (Ubuntu/Debian):** `sudo apt-get install poppler-utils`"
+            )
+        else:
+            st.warning(f"Image extraction warning: {e}")
         return []
 
 
