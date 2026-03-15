@@ -97,96 +97,269 @@ def priority_badge(priority: str) -> str:
     return ""
 
 
-def extract_page(pdf_bytes: bytes, page_num: int, dpi: int = 150) -> Image.Image | None:
-    """
-    Extract a single page from a PDF and return a cropped PIL Image.
-    Automatically crops out whitespace-heavy borders and text-only regions
-    so only the actual photo/thermal content is returned.
-    Page numbers are 1-indexed.
-    """
-    try:
-        pages = convert_from_bytes(
-            pdf_bytes, dpi=dpi,
-            first_page=page_num, last_page=page_num,
-            fmt="jpeg",
+def _poppler_error(e: Exception) -> bool:
+    """Return True and show a clear error if poppler is missing."""
+    err = str(e)
+    if "poppler" in err.lower() or "Unable to get page count" in err:
+        st.error(
+            "poppler is not installed or not in PATH.\n\n"
+            "**Streamlit Cloud:** add a `packages.txt` file containing `poppler-utils`.\n\n"
+            "**Local (Mac):** `brew install poppler`\n"
+            "**Local (Ubuntu/Debian):** `sudo apt-get install poppler-utils`"
         )
-        if not pages:
-            return None
-        img = pages[0]
-        return _smart_crop(img)
-    except Exception as e:
-        err = str(e)
-        if "poppler" in err.lower() or "Unable to get page count" in err:
-            st.error(
-                "poppler is not installed or not in PATH.\n\n"
-                "**Streamlit Cloud:** make sure your repo has a `packages.txt` "
-                "file containing `poppler-utils`.\n\n"
-                "**Local (Mac):** `brew install poppler`\n"
-                "**Local (Ubuntu/Debian):** `sudo apt-get install poppler-utils`"
-            )
-        return None
+        return True
+    return False
 
 
-def _smart_crop(img: Image.Image) -> Image.Image:
-    """
-    Crop a PDF page image to the most visually interesting region.
-    Strategy:
-      - Convert to grayscale
-      - Find rows/cols that are NOT near-white (i.e. contain actual content)
-      - Expand bounding box by a small margin and return that crop
-    Falls back to the full image if nothing useful is found.
-    """
-    import numpy as np
-    gray = img.convert("L")
-    arr  = np.array(gray)
-
-    # Pixels darker than 240 are considered "content" (not blank white)
-    content_mask = arr < 240
-
-    rows_with_content = content_mask.any(axis=1)
-    cols_with_content = content_mask.any(axis=0)
-
-    row_indices = np.where(rows_with_content)[0]
-    col_indices = np.where(cols_with_content)[0]
-
-    if len(row_indices) == 0 or len(col_indices) == 0:
-        return img  # nothing to crop, return as-is
-
-    top    = max(0, int(row_indices[0])  - 10)
-    bottom = min(img.height, int(row_indices[-1]) + 10)
-    left   = max(0, int(col_indices[0]) - 10)
-    right  = min(img.width,  int(col_indices[-1]) + 10)
-
-    # Only crop if it removes at least 5% of the page — avoids micro-crops
-    h_reduction = (img.height - (bottom - top))  / img.height
-    w_reduction = (img.width  - (right  - left))  / img.width
-    if h_reduction > 0.05 or w_reduction > 0.05:
-        return img.crop((left, top, right, bottom))
-    return img
-
-
-def extract_images_from_pdf(pdf_bytes: bytes, max_pages: int = 40, dpi: int = 100) -> list:
-    """Extract all pages as PIL Images (used for page-count discovery only)."""
+def _pdf_to_images(pdf_bytes: bytes, dpi: int = 120, max_pages: int = 60) -> list:
+    """Convert PDF pages to PIL Images. Returns [] on failure."""
     try:
-        images = convert_from_bytes(
+        return convert_from_bytes(
             pdf_bytes, dpi=dpi,
             first_page=1, last_page=max_pages,
             fmt="jpeg",
         )
-        return images
     except Exception as e:
-        err = str(e)
-        if "poppler" in err.lower() or "Unable to get page count" in err:
-            st.error(
-                "poppler is not installed or not in PATH.\n\n"
-                "**Streamlit Cloud:** make sure your repo has a `packages.txt` "
-                "file containing `poppler-utils`.\n\n"
-                "**Local (Mac):** `brew install poppler`\n"
-                "**Local (Ubuntu/Debian):** `sudo apt-get install poppler-utils`"
-            )
-        else:
-            st.warning(f"Image extraction warning: {e}")
+        _poppler_error(e)
         return []
+
+
+def _crop_to_content(img: Image.Image, white_thresh: int = 245) -> Image.Image:
+    """
+    Remove near-white margins from a page image.
+    Returns the tightest bounding box around non-white pixels,
+    with a small padding. Falls back to full image if nothing found.
+    """
+    import numpy as np
+    arr  = np.array(img.convert("L"))
+    mask = arr < white_thresh
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return img
+    pad = 8
+    top    = max(0,          int(rows[0])  - pad)
+    bottom = min(img.height, int(rows[-1]) + pad)
+    left   = max(0,          int(cols[0])  - pad)
+    right  = min(img.width,  int(cols[-1]) + pad)
+    return img.crop((left, top, right, bottom))
+
+
+def _extract_photos_from_page(page_img: Image.Image) -> list:
+    """
+    Extract the actual photograph(s) embedded in a PDF page.
+
+    Strategy — detect rectangular photo regions using contour analysis:
+    1. Convert to grayscale, threshold to binary
+    2. Find large rectangular regions that look like photos
+       (high colour variance, not near-white)
+    3. If detection fails, fall back to cropping the full page
+
+    For thermal pages the layout is always:
+      LEFT half  = thermal heat-map image
+      RIGHT half = visible-light photograph
+    We return BOTH halves as separate images.
+    """
+    import numpy as np
+
+    w, h = page_img.size
+
+    # ── Detect if this is a thermal page ────────────────────────────────
+    # Thermal pages have a strongly coloured (red/green/blue) left half
+    left_half  = page_img.crop((0, 0, w // 2, h))
+    right_half = page_img.crop((w // 2, 0, w, h))
+
+    left_arr  = np.array(left_half)
+    # Thermal images have high channel spread (false colour = large R-G or G-B diff)
+    r, g, b   = left_arr[:,:,0], left_arr[:,:,1], left_arr[:,:,2]
+    channel_spread = float(np.mean(np.abs(r.astype(int) - g.astype(int)) +
+                                   np.abs(g.astype(int) - b.astype(int))))
+
+    if channel_spread > 30:
+        # Thermal page — return thermal (left) and visible-light (right) separately
+        thermal_crop = _crop_to_content(left_half)
+        visible_crop = _crop_to_content(right_half)
+        return [("thermal", thermal_crop), ("visible", visible_crop)]
+    else:
+        # Regular inspection page — find photo regions
+        photos = _find_photo_regions(page_img)
+        if photos:
+            return [("photo", p) for p in photos]
+        # Fallback: return whole page cropped
+        return [("photo", _crop_to_content(page_img))]
+
+
+def _find_photo_regions(page_img: Image.Image) -> list:
+    """
+    Find embedded photo rectangles in an inspection PDF page.
+    Uses the fact that photos have:
+    - High local colour variance (not flat white/grey text areas)
+    - Rectangular shape
+    - Minimum size (at least 15% of page area)
+
+    Returns list of cropped PIL Images, or [] if none found.
+    """
+    import numpy as np
+
+    w, h   = page_img.size
+    arr    = np.array(page_img.convert("L"))
+    min_area = w * h * 0.10   # photo must be at least 10% of page
+
+    # Divide page into a grid and score each cell by colour variance
+    GRID   = 20
+    cell_w = w // GRID
+    cell_h = h // GRID
+    scores = np.zeros((GRID, GRID))
+
+    full_arr = np.array(page_img)
+    for gy in range(GRID):
+        for gx in range(GRID):
+            cell = full_arr[gy*cell_h:(gy+1)*cell_h, gx*cell_w:(gx+1)*cell_w]
+            # Score = std dev of pixel values (high = photo content, low = white/text)
+            scores[gy, gx] = float(np.std(cell))
+
+    # Threshold: cells with score > 25 are likely photo pixels
+    photo_mask = scores > 25
+
+    # Find connected rectangular blobs of high-score cells
+    from scipy import ndimage
+    labeled, n_features = ndimage.label(photo_mask)
+
+    regions = []
+    for label_id in range(1, n_features + 1):
+        blob = np.where(labeled == label_id)
+        gy_min, gy_max = int(blob[0].min()), int(blob[0].max())
+        gx_min, gx_max = int(blob[1].min()), int(blob[1].max())
+
+        # Convert grid coords back to pixel coords
+        px_top    = gy_min * cell_h
+        px_bottom = min(h, (gy_max + 1) * cell_h)
+        px_left   = gx_min * cell_w
+        px_right  = min(w, (gx_max + 1) * cell_w)
+
+        area = (px_bottom - px_top) * (px_right - px_left)
+        if area >= min_area:
+            crop = page_img.crop((px_left, px_top, px_right, px_bottom))
+            regions.append(crop)
+
+    return regions
+
+
+def _phash(img: Image.Image, hash_size: int = 16) -> "np.ndarray":
+    """
+    Compute a perceptual hash (pHash) of an image.
+    Returns a binary numpy array of length hash_size^2.
+    Works without any external library — uses PIL + numpy DCT approximation.
+    """
+    import numpy as np
+    # Resize to hash_size*4 for DCT, convert to greyscale
+    small  = img.convert("L").resize((hash_size * 4, hash_size * 4), Image.LANCZOS)
+    pixels = np.array(small, dtype=float)
+
+    # Apply 2D DCT-II manually (cheap version using row/col cosine projection)
+    dct_rows = np.zeros_like(pixels)
+    N = pixels.shape[1]
+    for k in range(hash_size * 4):
+        dct_rows[:, k] = np.sum(
+            pixels * np.cos(np.pi * k * (2 * np.arange(N) + 1) / (2 * N)),
+            axis=1,
+        )
+    dct_cols = np.zeros_like(dct_rows)
+    M = dct_rows.shape[0]
+    for k in range(hash_size * 4):
+        dct_cols[k, :] = np.sum(
+            dct_rows * np.cos(np.pi * k * (2 * np.arange(M) + 1) / (2 * M))[:, None],
+            axis=0,
+        )
+    # Take top-left hash_size x hash_size coefficients (low frequencies)
+    dct_low = dct_cols[:hash_size, :hash_size]
+    median  = np.median(dct_low)
+    return (dct_low > median).flatten()
+
+
+def _hash_distance(h1: "np.ndarray", h2: "np.ndarray") -> int:
+    """Hamming distance between two pHash arrays. Lower = more similar."""
+    return int(np.sum(h1 != h2))
+
+
+def match_thermal_to_inspection(
+    thermal_pages: list,         # list of PIL Images (full thermal PDF pages)
+    inspection_pages: list,      # list of PIL Images (full inspection PDF pages)
+    max_distance: int = 85,      # max hamming distance to count as a match (0–256)
+) -> dict:
+    """
+    Match each thermal page to its closest inspection photo using pHash.
+
+    Algorithm:
+    1. For each thermal page — extract the visible-light photo (right half)
+    2. For each inspection page — extract embedded photos
+    3. Compute pHash of every extracted photo
+    4. For each thermal visible-light photo, find the inspection photo
+       with the lowest hamming distance
+    5. Return dict: thermal_page_index (0-based) -> {
+           "inspection_page_idx": int,
+           "distance": int,
+           "thermal_img": PIL (heat map),
+           "visible_img": PIL (visible light from thermal),
+           "insp_img":    PIL (matched inspection photo),
+       }
+    """
+    import numpy as np
+
+    # Step 1 — extract and hash inspection photos
+    insp_photo_index = []   # list of (page_idx, PIL_image, hash)
+    for pg_idx, page in enumerate(inspection_pages):
+        extracted = _extract_photos_from_page(page)
+        for kind, photo in extracted:
+            if photo.width > 60 and photo.height > 60:   # skip tiny fragments
+                h = _phash(photo)
+                insp_photo_index.append((pg_idx, photo, h))
+
+    if not insp_photo_index:
+        return {}
+
+    # Step 2 — for each thermal page, extract visible-light half and match
+    matches = {}
+    for th_idx, therm_page in enumerate(thermal_pages):
+        parts = _extract_photos_from_page(therm_page)
+        thermal_img  = None
+        visible_img  = None
+        for kind, img in parts:
+            if kind == "thermal":
+                thermal_img = img
+            elif kind == "visible":
+                visible_img = img
+
+        if visible_img is None:
+            continue
+
+        vis_hash = _phash(visible_img)
+
+        # Find closest inspection photo
+        best_dist  = 9999
+        best_entry = None
+        for pg_idx, insp_photo, insp_hash in insp_photo_index:
+            d = _hash_distance(vis_hash, insp_hash)
+            if d < best_dist:
+                best_dist  = d
+                best_entry = (pg_idx, insp_photo)
+
+        if best_entry and best_dist <= max_distance:
+            pg_idx, insp_photo = best_entry
+            matches[th_idx] = {
+                "inspection_page_idx": pg_idx,
+                "distance":            best_dist,
+                "thermal_img":         thermal_img,
+                "visible_img":         visible_img,
+                "insp_img":            insp_photo,
+            }
+
+    return matches
+
+
+def extract_images_from_pdf(pdf_bytes: bytes, max_pages: int = 60, dpi: int = 100) -> list:
+    """Convert PDF pages to PIL Images. Returns [] on failure."""
+    return _pdf_to_images(pdf_bytes, dpi=dpi, max_pages=max_pages)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -762,18 +935,27 @@ if st.button("🔍 Generate Detailed Diagnosis Report", disabled=not ready):
     thermal_bytes    = thermal_file.read() if thermal_file else None
     has_thermal      = thermal_bytes is not None
 
-    # Step 1 — get page counts (low DPI just to count pages quickly)
-    with st.spinner("📄 Reading PDF page counts…"):
-        insp_pages_all  = extract_images_from_pdf(inspection_bytes, max_pages=60, dpi=40)
-        therm_pages_all = extract_images_from_pdf(thermal_bytes,    max_pages=60, dpi=40) if has_thermal else []
-        n_insp  = len(insp_pages_all)
-        n_therm = len(therm_pages_all)
-        del insp_pages_all, therm_pages_all  # free memory — we'll re-extract only needed pages later
+    # Step 1 — extract all pages at medium DPI for matching + display
+    with st.spinner("📄 Extracting PDF pages…"):
+        insp_pages  = extract_images_from_pdf(inspection_bytes, max_pages=60, dpi=120)
+        therm_pages = extract_images_from_pdf(thermal_bytes,    max_pages=60, dpi=120) if has_thermal else []
+        n_insp  = len(insp_pages)
+        n_therm = len(therm_pages)
 
     st.info(
         f"Found {n_insp} page(s) in inspection PDF"
         + (f" and {n_therm} in thermal PDF." if has_thermal else ".")
     )
+
+    # Step 1b — algorithmically match thermal pages to inspection photos
+    thermal_matches = {}   # thermal_page_idx (0-based) -> match dict
+    if has_thermal and therm_pages and insp_pages:
+        with st.spinner("🔍 Matching thermal images to inspection photos using perceptual hashing…"):
+            thermal_matches = match_thermal_to_inspection(
+                therm_pages, insp_pages, max_distance=85
+            )
+        n_matched = len(thermal_matches)
+        st.info(f"Matched {n_matched} of {n_therm} thermal pages to inspection photos.")
 
     # Step 2 — Gemini analysis
     SYSTEM = """You are UrbanRoof's expert building diagnostics AI. Your job is to read an
@@ -954,41 +1136,80 @@ OUTPUT — valid JSON only, no markdown, no preamble
 
             data = json.loads(m.group())
 
-            # Extract only the pages Gemini assigned — smart crop each one
+            # Build area_images using Gemini page assignments + algo-matched thermal
             assignments = data.get("imageAssignments", [])
-            area_images = {}   # areaName -> {"insp": [PIL], "therm": [PIL]}
+            areas_list  = data.get("areas", [])
+            area_images = {}   # areaName -> {"insp": [PIL], "therm": [PIL], "pairs": [(insp,therm)]}
 
-            if assignments:
-                with st.spinner("🖼️ Extracting relevant images from PDFs…"):
-                    for assign in assignments:
-                        name   = assign.get("areaName", "")
-                        i_pgs  = assign.get("inspectionPages", [])
-                        t_pgs  = assign.get("thermalPages", [])
+            with st.spinner("🖼️ Building image set per area…"):
+                # Index inspection photos extracted per page
+                insp_photo_cache = {}   # page_idx -> list of cropped photos
+                for pg_idx, page in enumerate(insp_pages):
+                    parts = _extract_photos_from_page(page)
+                    photos = [img for kind, img in parts if img.width > 60]
+                    if photos:
+                        insp_photo_cache[pg_idx] = photos
 
-                        insp_extracted  = []
-                        therm_extracted = []
+                # Build per-area images from Gemini assignments
+                for assign in assignments:
+                    name  = assign.get("areaName", "").strip()
+                    i_pgs = [p-1 for p in assign.get("inspectionPages", [])
+                             if isinstance(p, int) and 1 <= p <= n_insp]  # to 0-based
 
-                        for pg in i_pgs:
-                            if isinstance(pg, int) and 1 <= pg <= n_insp:
-                                img = extract_page(inspection_bytes, pg, dpi=150)
-                                if img:
-                                    insp_extracted.append(img)
+                    insp_extracted = []
+                    for pg_idx in i_pgs[:3]:
+                        photos = insp_photo_cache.get(pg_idx, [])
+                        insp_extracted.extend(photos[:2])  # max 2 photos per page
 
-                        for pg in t_pgs:
-                            if has_thermal and isinstance(pg, int) and 1 <= pg <= n_therm:
-                                img = extract_page(thermal_bytes, pg, dpi=150)
-                                if img:
-                                    therm_extracted.append(img)
+                    area_images.setdefault(name, {"insp": [], "therm": [], "pairs": []})
+                    area_images[name]["insp"] = insp_extracted[:3]
 
-                        if name:
-                            area_images[name] = {
-                                "insp": insp_extracted,
-                                "therm": therm_extracted,
-                            }
+                # Attach matched thermal images to their closest area
+                # Strategy: find which Gemini area the matched inspection page belongs to
+                # Build reverse map: inspection_page_idx -> area_name
+                page_to_area = {}
+                for assign in assignments:
+                    name  = assign.get("areaName", "").strip()
+                    i_pgs = [p-1 for p in assign.get("inspectionPages", [])
+                             if isinstance(p, int) and 1 <= p <= n_insp]
+                    for pg_idx in i_pgs:
+                        page_to_area[pg_idx] = name
+
+                for th_idx, match in thermal_matches.items():
+                    insp_pg_idx   = match["inspection_page_idx"]
+                    area_name     = page_to_area.get(insp_pg_idx, "")
+                    thermal_img   = match.get("thermal_img")
+                    visible_img   = match.get("visible_img")
+                    insp_img      = match.get("insp_img")
+
+                    if not area_name:
+                        # No Gemini area claimed this page — assign to closest area
+                        # by finding which area has inspection photos on similar pages
+                        # (simple fallback: assign to first area with no thermal yet)
+                        for a in areas_list:
+                            aname = a.get("name","")
+                            if aname in area_images and not area_images[aname]["therm"]:
+                                area_name = aname
+                                break
+
+                    if area_name:
+                        entry = area_images.setdefault(area_name,
+                                    {"insp": [], "therm": [], "pairs": []})
+                        if thermal_img and len(entry["therm"]) < 2:
+                            entry["therm"].append(thermal_img)
+                        # Store matched pair for side-by-side display
+                        if insp_img and visible_img:
+                            entry["pairs"].append({
+                                "insp":    insp_img,
+                                "visible": visible_img,
+                                "thermal": thermal_img,
+                                "distance": match["distance"],
+                            })
 
             st.session_state.update({
                 "ddr_data": data, "had_thermal": has_thermal,
                 "area_images": area_images,
+                "thermal_matches": thermal_matches,
             })
 
         except json.JSONDecodeError as e:
@@ -1012,9 +1233,10 @@ OUTPUT — valid JSON only, no markdown, no preamble
 # RENDER REPORT
 # ═══════════════════════════════════════════════════════════════════════════════
 if "ddr_data" in st.session_state:
-    data        = st.session_state["ddr_data"]
-    had_thermal = st.session_state.get("had_thermal", False)
-    area_images = st.session_state.get("area_images", {})
+    data            = st.session_state["ddr_data"]
+    had_thermal     = st.session_state.get("had_thermal", False)
+    area_images     = st.session_state.get("area_images", {})
+    thermal_matches = st.session_state.get("thermal_matches", {})
 
     prop          = data.get("property", {})
     summ          = data.get("summary", {})
@@ -1086,31 +1308,62 @@ if "ddr_data" in st.session_state:
                 {f'<br><span style="font-size:11px;opacity:0.85;">{therm_sb}</span>' if has_sb else ""}
             </div>'''
 
+        # ── Render area card (HTML only — no st.image inside HTML block) ──
         st.markdown(f"""
         <div class="area-card">
-            <div class="area-header"><span class="area-name">{aname}</span>{severity_badge(area.get('severity',''))}</div>
+            <div class="area-header">
+                <span class="area-name">{aname}</span>
+                {severity_badge(area.get("severity",""))}
+            </div>
             <div style="font-size:13px;line-height:1.65;color:#555;">
-                {"<p><strong style='color:#1a1a1a;'>Damage observed (negative side):</strong><br>"+neg+"</p>" if neg else ""}
-                {"<p style='margin-top:6px;'><strong style='color:#1a1a1a;'>Root cause area (positive side):</strong><br>"+pos+"</p>" if pos else ""}
+                {"<p><strong style=\'color:#1a1a1a;\'>Damage observed (negative side):</strong><br>"+neg+"</p>" if neg else ""}
+                {"<p style=\'margin-top:6px;\'><strong style=\'color:#1a1a1a;\'>Root cause area (positive side):</strong><br>"+pos+"</p>" if pos else ""}
                 {tnote}
             </div>
         </div>""", unsafe_allow_html=True)
 
-        # Inspection images (left) and thermal images (right) — side by side per pair
+        # ── Images rendered OUTSIDE the HTML block (fixes <div> rendering bug) ──
         assigned   = area_images.get(aname, {})
         insp_imgs  = assigned.get("insp",  [])[:3]
         therm_imgs = assigned.get("therm", [])[:2]
+        pairs      = assigned.get("pairs", [])
 
-        if insp_imgs or therm_imgs:
-            # Show inspection and thermal images in labelled columns
-            all_pairs = (
+        if pairs:
+            # Show algorithmically matched pairs: inspection | visible-light | thermal
+            st.caption("📷 Matched images — inspection photo  ↔  thermal visible-light  ↔  thermal heat-map")
+            for pair in pairs[:2]:
+                c1, c2, c3 = st.columns(3)
+                c1.caption("Inspection photo")
+                c1.image(pair["insp"],    use_container_width=True)
+                c2.caption("Thermal visible-light")
+                c2.image(pair["visible"], use_container_width=True)
+                if pair.get("thermal") is not None:
+                    c3.caption(f"Thermal heat-map (match score: {pair['distance']})")
+                    c3.image(pair["thermal"], use_container_width=True)
+                else:
+                    c3.caption("Heat-map")
+                    c3.markdown(
+                        '<div style="background:#f5f5f5;border-radius:6px;padding:1.5rem;'
+                        'text-align:center;color:#aaa;font-size:12px;">No thermal image</div>',
+                        unsafe_allow_html=True
+                    )
+        elif insp_imgs or therm_imgs:
+            # Fallback: show individual images without pairing
+            all_display = (
                 [("📷 Inspection", img) for img in insp_imgs] +
                 [("🌡️ Thermal",    img) for img in therm_imgs]
             )
-            cols = st.columns(len(all_pairs))
-            for col, (label, img) in zip(cols, all_pairs):
+            cols = st.columns(len(all_display))
+            for col, (label, img) in zip(cols, all_display):
                 col.caption(label)
                 col.image(img, use_container_width=True)
+        else:
+            st.markdown(
+                '<div style="background:#f9f9f9;border:1px dashed #ddd;border-radius:6px;'
+                'padding:0.75rem 1rem;color:#bbb;font-size:12px;margin-bottom:8px;">'
+                '📷 No images available for this area</div>',
+                unsafe_allow_html=True
+            )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1202,6 +1455,6 @@ if "ddr_data" in st.session_state:
         )
     with dl3:
         if st.button("🔄 Generate New Report"):
-            for k in ["ddr_data","had_thermal","area_images"]:
+            for k in ["ddr_data","had_thermal","area_images","thermal_matches"]:
                 st.session_state.pop(k, None)
             st.rerun()
