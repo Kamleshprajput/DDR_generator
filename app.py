@@ -17,6 +17,7 @@ from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
     HRFlowable, KeepTogether, Image as RLImage, PageBreak
 )
+import numpy as np
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
